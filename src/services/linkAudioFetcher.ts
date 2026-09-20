@@ -129,8 +129,10 @@ export async function fetchAudioTrackFromLink(
 
   onProgress?.(10);
 
-  // 1. Fetch audio bytes through proxy or direct
-  const proxyUrl = `/api/proxy-stream?url=${encodeURIComponent(info.audioUrl)}`;
+  const songId = info.id || info.originalUrl.match(/([0-9a-fA-F-]{32,36})/)?.[1];
+  const proxyUrl = info.source === 'suno' && songId
+    ? `/api/proxy-stream?url=${encodeURIComponent(info.audioUrl)}&contentId=${encodeURIComponent(songId)}&suno=1`
+    : `/api/proxy-stream?url=${encodeURIComponent(info.audioUrl)}`;
   let response: Response;
 
   try {
@@ -186,7 +188,6 @@ export async function fetchAudioTrackFromLink(
 
   // 2. If track is from Suno, decrypt the progressive DRM stream (AES-CTR)
   let playableBuffer = arrayBuffer;
-  const songId = info.id || info.originalUrl.match(/([0-9a-fA-F-]{32,36})/)?.[1];
   if (info.source === 'suno' && songId) {
     onProgress?.(75);
     try {

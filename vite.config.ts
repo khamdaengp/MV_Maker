@@ -2,6 +2,7 @@ import { defineConfig, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import http from 'node:http';
 import https from 'node:https';
+import crypto from 'node:crypto';
 import { URL } from 'node:url';
 
 function fetchRemote(
@@ -89,6 +90,52 @@ function postRemoteJson(
     req.write(bodyStr);
     req.end();
   });
+}
+
+async function decryptSunoBuffer(songId: string, encryptedBuf: Buffer): Promise<Buffer> {
+  // If already decrypted M4A container (begins with 'ftyp' at offset 4)
+  if (encryptedBuf.length >= 8 && encryptedBuf.subarray(4, 8).toString('utf8') === 'ftyp') {
+    return encryptedBuf;
+  }
+
+  // 1. Fetch license rights
+  const rightsRes = await postRemoteJson('https://studio-api.prod.suno.com/api/mango/rights', {
+    content_params: { content_id: songId, content_type: 'clip' },
+  });
+  if (rightsRes.status !== 200) {
+    throw new Error(`Suno rights request failed with status ${rightsRes.status}: ${rightsRes.text}`);
+  }
+  const rights = JSON.parse(rightsRes.text);
+
+  // 2. Derive guest key from glt (SHA-256)
+  const guestKey = crypto.createHash('sha256').update(rights.glt, 'utf8').digest();
+
+  // 3. Decrypt Content Key (AES-256-GCM)
+  const keyBytes = Buffer.from(rights.key, 'base64');
+  const keyIv = keyBytes.subarray(0, 12);
+  const keyTag = keyBytes.subarray(keyBytes.length - 16);
+  const keyCiphertext = keyBytes.subarray(12, keyBytes.length - 16);
+
+  const decipherGcm = crypto.createDecipheriv('aes-256-gcm', guestKey, keyIv);
+  decipherGcm.setAAD(Buffer.from(songId, 'utf8'));
+  decipherGcm.setAuthTag(keyTag);
+  const ctrKey = Buffer.concat([decipherGcm.update(keyCiphertext), decipherGcm.final()]);
+
+  // 4. Decrypt IV (AES-256-GCM)
+  const ivBytes = Buffer.from(rights.iv, 'base64');
+  const ivIv = ivBytes.subarray(0, 12);
+  const ivTag = ivBytes.subarray(ivBytes.length - 16);
+  const ivCiphertext = ivBytes.subarray(12, ivBytes.length - 16);
+
+  const decipherIvGcm = crypto.createDecipheriv('aes-256-gcm', guestKey, ivIv);
+  decipherIvGcm.setAAD(Buffer.from(songId, 'utf8'));
+  decipherIvGcm.setAuthTag(ivTag);
+  const decryptedIv = Buffer.concat([decipherIvGcm.update(ivCiphertext), decipherIvGcm.final()]);
+
+  // 5. Decrypt Audio Stream (AES-CTR)
+  const cipherName = ctrKey.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
+  const decipherCtr = crypto.createDecipheriv(cipherName, ctrKey, decryptedIv.subarray(0, 16));
+  return Buffer.concat([decipherCtr.update(encryptedBuf), decipherCtr.final()]);
 }
 
 function linkProxyPlugin(): Plugin {
@@ -247,7 +294,7 @@ function linkProxyPlugin(): Plugin {
       });
 
       // 2. Proxy Media Stream: /api/proxy-stream?url=...
-      server.middlewares.use((req, res, next) => {
+      server.middlewares.use(async (req, res, next) => {
         if (!req.url || !req.url.startsWith('/api/proxy-stream')) {
           return next();
         }
@@ -255,11 +302,39 @@ function linkProxyPlugin(): Plugin {
         try {
           const parsedReq = new URL(req.url, 'http://localhost');
           const targetUrl = parsedReq.searchParams.get('url');
+          const explicitSongId = parsedReq.searchParams.get('contentId');
+          const shouldDecrypt = parsedReq.searchParams.get('suno') === '1' || parsedReq.searchParams.get('decrypt') === '1';
 
           if (!targetUrl) {
             res.statusCode = 400;
             res.end('Missing url parameter');
             return;
+          }
+
+          // Check if this is a Suno stream (either by param or cloudfront URL)
+          const sunoMatch = targetUrl.match(/cloudfront\.net\/1\/clip\/([0-9a-fA-F-]{32,36})/);
+          const songId = explicitSongId || (sunoMatch ? sunoMatch[1] : null);
+
+          // If it is a Suno stream, auto-decrypt server-side for seamless playback
+          if (songId && (shouldDecrypt || sunoMatch)) {
+            try {
+              const remote = await fetchRemote(targetUrl);
+              if (remote.status >= 200 && remote.status < 300) {
+                const decrypted = await decryptSunoBuffer(songId, remote.body);
+
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+                res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
+                res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
+                res.setHeader('Content-Type', 'audio/mp4');
+                res.setHeader('Content-Length', decrypted.length);
+                res.statusCode = 200;
+                res.end(decrypted);
+                return;
+              }
+            } catch (decErr) {
+              console.warn('Server-side Suno auto-decryption failed, falling back to stream passthrough:', decErr);
+            }
           }
 
           const parsed = new URL(targetUrl);
@@ -316,7 +391,62 @@ function linkProxyPlugin(): Plugin {
         }
       });
 
-      // 3. Suno Rights Proxy: /api/suno-rights?contentId=...
+      // 3. Dedicated Decrypt Endpoint: /api/suno-decrypt?contentId=...
+      server.middlewares.use(async (req, res, next) => {
+        if (!req.url || !req.url.startsWith('/api/suno-decrypt')) {
+          return next();
+        }
+
+        try {
+          const parsedReq = new URL(req.url, 'http://localhost');
+          const contentId = parsedReq.searchParams.get('contentId');
+
+          if (!contentId) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Missing contentId parameter' }));
+            return;
+          }
+
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+          if (req.method === 'OPTIONS') {
+            res.statusCode = 204;
+            res.end();
+            return;
+          }
+
+          let encryptedBuf: Buffer;
+          if (req.method === 'POST') {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            encryptedBuf = Buffer.concat(chunks);
+          } else {
+            const audioUrl = parsedReq.searchParams.get('audioUrl') || `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${contentId}.m4a`;
+            const remote = await fetchRemote(audioUrl);
+            encryptedBuf = remote.body;
+          }
+
+          const decrypted = await decryptSunoBuffer(contentId, encryptedBuf);
+          res.setHeader('Content-Type', 'audio/mp4');
+          res.setHeader('Content-Length', decrypted.length);
+          res.statusCode = 200;
+          res.end(decrypted);
+        } catch (err: unknown) {
+          const error = err as Error;
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: error.message || 'Decryption failed' }));
+          }
+        }
+      });
+
+      // 4. Suno Rights Proxy: /api/suno-rights?contentId=...
       server.middlewares.use(async (req, res, next) => {
         if (!req.url || !req.url.startsWith('/api/suno-rights')) {
           return next();

@@ -32,7 +32,7 @@ export async function decryptSunoAudioBuffer(
   contentId: string,
   buffer: ArrayBuffer
 ): Promise<ArrayBuffer> {
-  // Check if already decrypted (MP4 container begins with 'ftyp' at offset 4)
+  // 1. Check if already decrypted (MP4 container begins with 'ftyp' at offset 4)
   if (buffer.byteLength >= 8) {
     const view = new DataView(buffer);
     if (view.getUint32(4) === 0x66747970) {
@@ -40,7 +40,35 @@ export async function decryptSunoAudioBuffer(
     }
   }
 
-  // 1. Fetch license from Suno rights server (or local proxy)
+  // 2. Try server-side decryption proxy first (handles insecure contexts / LAN IP without WebCrypto)
+  try {
+    const serverRes = await fetch(`/api/suno-decrypt?contentId=${encodeURIComponent(contentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: buffer,
+    });
+    if (serverRes.ok) {
+      const serverDecrypted = await serverRes.arrayBuffer();
+      if (serverDecrypted.byteLength >= 8) {
+        const view = new DataView(serverDecrypted);
+        if (view.getUint32(4) === 0x66747970) {
+          return serverDecrypted;
+        }
+      }
+    }
+  } catch {
+    // Server proxy unavailable, fallback to client WebCrypto
+  }
+
+  // 3. Client-side WebCrypto Fallback
+  const subtle = typeof window !== 'undefined' ? window.crypto?.subtle : undefined;
+  if (!subtle) {
+    throw new Error(
+      'WebCrypto is not supported in this browser context (non-secure HTTP). Please access via http://localhost:3000 or HTTPS.'
+    );
+  }
+
+  // 4. Fetch license from Suno rights server (or local proxy)
   let rights: { key: string; iv: string; glt: string };
   try {
     const rightsRes = await fetch('https://studio-api.prod.suno.com/api/mango/rights', {
@@ -71,9 +99,7 @@ export async function decryptSunoAudioBuffer(
     rights = await proxyRes.json();
   }
 
-  const subtle = window.crypto.subtle;
-
-  // 2. Derive Guest Key from GLT (AES-GCM)
+  // 5. Derive Guest Key from GLT (AES-GCM)
   const gltBytes = new TextEncoder().encode(rights.glt);
   const gltHash = await subtle.digest('SHA-256', gltBytes);
   const guestKey = await subtle.importKey(
