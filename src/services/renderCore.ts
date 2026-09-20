@@ -445,3 +445,256 @@ export async function executeRenderPipeline(
   muxer.finalize();
   return target.buffer;
 }
+
+/**
+ * Universal Fallback: Renders video via MediaRecorder API.
+ * Ensures video can be exported in Firefox, Safari, non-secure HTTP contexts,
+ * and mobile devices where WebCodecs VideoEncoder/AudioEncoder is unavailable.
+ */
+export async function executeMediaRecorderPipeline(
+  canvas: HTMLCanvasElement,
+  params: RenderParams,
+  preferredMime?: string
+): Promise<{ blob: Blob; mimeType: string }> {
+  const {
+    width,
+    height,
+    fps,
+    duration,
+    videoBitrateMbps,
+    audioBitrateKbps,
+    style,
+    sampleRate,
+    numberOfChannels,
+    audioChannels,
+    images,
+    beatTimestamps,
+    trackIntervals,
+    onProgress,
+    isCancelled,
+  } = params;
+
+  // Force even dimensions
+  const evenWidth = width - (width % 2);
+  const evenHeight = height - (height % 2);
+  canvas.width = evenWidth;
+  canvas.height = evenHeight;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Failed to create canvas 2D rendering context');
+  }
+
+  // 1. Setup AudioContext and AudioBuffer
+  const AudioContextClass =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const audioCtx = new AudioContextClass({ sampleRate });
+
+  const totalAudioSamples = Math.floor(duration * sampleRate);
+  const audioBuffer = audioCtx.createBuffer(numberOfChannels, totalAudioSamples, sampleRate);
+  for (let ch = 0; ch < numberOfChannels; ch++) {
+    const chData = audioChannels[ch] || audioChannels[0];
+    const copyBuf = new Float32Array(totalAudioSamples);
+    copyBuf.set(chData.subarray(0, totalAudioSamples));
+    audioBuffer.copyToChannel(copyBuf, ch);
+  }
+
+  const audioDest = audioCtx.createMediaStreamDestination();
+  const sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = audioBuffer;
+  sourceNode.connect(audioDest);
+
+  // 2. Prepare FFT Audio Analyzer
+  const audioAnalyzer = new OfflineAudioAnalyzer(1024, style.visualizer.smoothing);
+  const primaryChannel = audioChannels[0];
+
+  // 3. Setup Streams
+  const videoStream = canvas.captureStream(fps);
+  const combinedStream = new MediaStream([
+    ...videoStream.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+
+  // 4. Determine supported MIME type
+  let mimeType = preferredMime || '';
+  if (!mimeType || (typeof MediaRecorder !== 'undefined' && !MediaRecorder.isTypeSupported(mimeType))) {
+    const candidateMimes = [
+      'video/mp4;codecs=avc1,mp4a.40.2',
+      'video/mp4;codecs=avc1',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const cand of candidateMimes) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(cand)) {
+        mimeType = cand;
+        break;
+      }
+    }
+  }
+
+  const recorder = new MediaRecorder(combinedStream, {
+    mimeType: mimeType || undefined,
+    videoBitsPerSecond: Math.round(videoBitrateMbps * 1_000_000),
+    audioBitsPerSecond: Math.round(audioBitrateKbps * 1_000),
+  });
+
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) {
+      chunks.push(e.data);
+    }
+  };
+
+  const totalFrames = Math.ceil(duration * fps);
+  let renderedFrames = 0;
+
+  // 5. Run real-time paced rendering loop synced with audio playback
+  await new Promise<void>((resolve, reject) => {
+    recorder.onstop = () => resolve();
+    recorder.onerror = (e) => reject(e);
+
+    recorder.start(100);
+    sourceNode.start(0);
+
+    const startTime = performance.now();
+    const totalDurationMs = duration * 1000;
+    let animId = 0;
+
+    function renderLoop() {
+      if (isCancelled()) {
+        cancelAnimationFrame(animId);
+        try { sourceNode.stop(); } catch {}
+        try { recorder.stop(); } catch {}
+        reject(new Error('Render cancelled by user'));
+        return;
+      }
+
+      const elapsedMs = performance.now() - startTime;
+      const currentTime = Math.min(elapsedMs / 1000, duration);
+      const currentFrame = Math.min(Math.floor(currentTime * fps), totalFrames);
+      const sampleIdx = Math.floor(currentTime * sampleRate);
+
+      // Perform FFT audio analysis
+      const { frequencyData, timeDomainData } = audioAnalyzer.getFrameData(
+        primaryChannel,
+        sampleIdx
+      );
+
+      // Determine current & next image based on Slideshow Mode
+      let currentImage: DrawableImage | null = null;
+      let nextImage: DrawableImage | null = null;
+      let crossfadeAlpha = 0;
+
+      if (images.length > 0) {
+        if (style.slideshowMode === 'single' || images.length === 1) {
+          currentImage = images[0];
+        } else if (style.slideshowMode === 'even') {
+          const imgDuration = duration / images.length;
+          const rawIdx = Math.floor(currentTime / imgDuration);
+          const curIdx = rawIdx % images.length;
+          const nxtIdx = (curIdx + 1) % images.length;
+          currentImage = images[curIdx];
+          nextImage = images[nxtIdx];
+
+          const timeInSegment = currentTime - rawIdx * imgDuration;
+          const transStart = Math.max(0, imgDuration - style.crossfadeDuration);
+          if (timeInSegment > transStart && style.crossfadeDuration > 0) {
+            crossfadeAlpha = (timeInSegment - transStart) / style.crossfadeDuration;
+          }
+        } else if (style.slideshowMode === 'beat_synced') {
+          let beatIdx = 0;
+          for (let b = 0; b < beatTimestamps.length; b++) {
+            if (currentTime >= beatTimestamps[b]) {
+              beatIdx = b + 1;
+            } else {
+              break;
+            }
+          }
+          const curIdx = beatIdx % images.length;
+          const nxtIdx = (curIdx + 1) % images.length;
+          currentImage = images[curIdx];
+          nextImage = images[nxtIdx];
+
+          const nextBeatTime = beatTimestamps[beatIdx] ?? duration;
+          const transStart = Math.max(0, nextBeatTime - 0.3);
+          if (currentTime > transStart) {
+            crossfadeAlpha = (currentTime - transStart) / 0.3;
+          }
+        }
+      }
+
+      // Determine active track metadata
+      let activeTrack = trackIntervals[0];
+      for (const track of trackIntervals) {
+        if (
+          currentTime >= track.startTime &&
+          currentTime < track.startTime + track.duration + 0.1
+        ) {
+          activeTrack = track;
+          break;
+        }
+      }
+
+      const songLocalTime = activeTrack ? Math.max(0, currentTime - activeTrack.startTime) : currentTime;
+      const songDuration = activeTrack ? activeTrack.duration : duration;
+
+      // Draw visualizer frame
+      renderVisualizerFrame(ctx!, {
+        width: evenWidth,
+        height: evenHeight,
+        currentImage,
+        nextImage,
+        crossfadeAlpha,
+        frequencyData,
+        timeDomainData,
+        style,
+        currentTime: songLocalTime,
+        text: activeTrack
+          ? {
+              title: activeTrack.title,
+              artist: activeTrack.artist,
+              currentTime: songLocalTime,
+              trackDuration: songDuration,
+            }
+          : undefined,
+      });
+
+      renderedFrames++;
+      const progressPercent = Math.min(Math.round((currentTime / duration) * 100), 99);
+      const elapsedSec = (performance.now() - startTime) / 1000;
+      const fpsEstimate = elapsedSec > 0 ? Math.round(renderedFrames / elapsedSec) : fps;
+      const remainingSec = Math.max(0, Math.round(duration - currentTime));
+
+      onProgress({
+        currentFrame,
+        totalFrames,
+        progressPercent,
+        fpsEstimate,
+        etaSeconds: remainingSec,
+      });
+
+      if (elapsedMs >= totalDurationMs) {
+        cancelAnimationFrame(animId);
+        try { sourceNode.stop(); } catch {}
+        if (recorder.state !== 'inactive') {
+          recorder.stop();
+        }
+        return;
+      }
+
+      animId = requestAnimationFrame(renderLoop);
+    }
+
+    animId = requestAnimationFrame(renderLoop);
+  });
+
+  try {
+    await audioCtx.close();
+  } catch {}
+
+  const finalBlob = new Blob(chunks, { type: mimeType || 'video/mp4' });
+  return { blob: finalBlob, mimeType: mimeType || 'video/mp4' };
+}

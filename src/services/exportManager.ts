@@ -2,7 +2,7 @@ import { zipSync } from 'fflate';
 import { AudioTrack, ImageItem, OutputConfig, RenderJob, StyleConfig } from '../types';
 import { detectAudioBeats } from './beatDetector';
 import { checkBrowserWebCodecsSupport, getOptimalVideoCodecForResolution } from './webcodecsChecker';
-import { executeRenderPipeline, TrackInterval } from './renderCore';
+import { executeRenderPipeline, executeMediaRecorderPipeline, TrackInterval } from './renderCore';
 
 /**
  * Sanitizes a string for use as a safe filename.
@@ -175,8 +175,8 @@ export class ExportManager {
 
     // Check codecs
     const codecSupport = await checkBrowserWebCodecsSupport();
-    if (!codecSupport.hasWebCodecs) {
-      throw new Error(codecSupport.errorMessage || 'WebCodecs not supported');
+    if (!codecSupport.hasWebCodecs && !codecSupport.hasMediaRecorder) {
+      throw new Error(codecSupport.errorMessage || 'Video rendering is not supported in this browser');
     }
 
     const { images, style, output } = jobConfig;
@@ -232,7 +232,43 @@ export class ExportManager {
       output.videoBitrateMbps
     )) || codecSupport.supportedVideoCodec || 'avc1.42001f';
 
-    // Try Worker execution first
+    // Route A: MediaRecorder Fallback (Firefox, Safari, non-secure HTTP contexts)
+    if (!codecSupport.hasWebCodecs && codecSupport.hasMediaRecorder) {
+      const canvas = document.createElement('canvas');
+      const { blob, mimeType } = await executeMediaRecorderPipeline(
+        canvas,
+        {
+          width: output.width,
+          height: output.height,
+          fps: output.fps,
+          duration,
+          videoBitrateMbps: output.videoBitrateMbps,
+          audioBitrateKbps: output.audioBitrateKbps,
+          audioCodec: selectedAudioCodec,
+          audioCodecMime: selectedAudioMime,
+          videoCodec: optimalVideoCodec,
+          style,
+          sampleRate,
+          numberOfChannels,
+          audioChannels,
+          images: imageBitmaps,
+          beatTimestamps,
+          trackIntervals,
+          onProgress,
+          isCancelled: () => this.isCancelledFlag,
+        },
+        codecSupport.recorderMimeType
+      );
+
+      // If recorded as WebM instead of MP4, adjust fileName
+      if (mimeType.includes('webm') && _job.fileName.endsWith('.mp4')) {
+        _job.fileName = _job.fileName.replace(/\.mp4$/, '.webm');
+      }
+
+      return blob;
+    }
+
+    // Route B: High-Performance Hardware WebCodecs (Worker or Main Thread fallback)
     try {
       const buffer = await this.renderInWorker({
         width: output.width,

@@ -7,25 +7,77 @@ export interface CodecSupportResult {
   hasVideoEncoder: boolean;
   hasAudioEncoder: boolean;
   hasOffscreenCanvas: boolean;
+  hasMediaRecorder: boolean;
+  engine: 'webcodecs' | 'mediarecorder' | 'none';
   supportedVideoCodec?: string;
   supportedAudioCodec?: 'aac' | 'opus';
   audioCodecMime?: string;
+  recorderMimeType?: string;
   errorMessage?: string;
+  warningMessage?: string;
 }
 
 export async function checkBrowserWebCodecsSupport(): Promise<CodecSupportResult> {
   const hasVideoEncoder = typeof window !== 'undefined' && 'VideoEncoder' in window;
   const hasAudioEncoder = typeof window !== 'undefined' && 'AudioEncoder' in window;
   const hasOffscreenCanvas = typeof window !== 'undefined' && 'OffscreenCanvas' in window;
+  const hasMediaRecorder = typeof window !== 'undefined' && 'MediaRecorder' in window;
 
+  // Determine optimal MediaRecorder MIME type if available
+  let recorderMimeType: string | undefined;
+  if (hasMediaRecorder) {
+    const candidateMimes = [
+      'video/mp4;codecs=avc1,mp4a.40.2',
+      'video/mp4;codecs=avc1',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const m of candidateMimes) {
+      if (MediaRecorder.isTypeSupported(m)) {
+        recorderMimeType = m;
+        break;
+      }
+    }
+  }
+
+  // Case 1: Browser does NOT support WebCodecs (e.g. Firefox, Safari, or HTTP LAN IP)
   if (!hasVideoEncoder || !hasAudioEncoder) {
+    if (hasMediaRecorder) {
+      const isLanOrHttp = typeof window !== 'undefined' &&
+        window.location.protocol === 'http:' &&
+        window.location.hostname !== 'localhost' &&
+        window.location.hostname !== '127.0.0.1';
+
+      const warningMessage = isLanOrHttp
+        ? 'WebCodecs hardware acceleration is restricted by browsers on non-localhost HTTP. Running in MediaRecorder compatibility mode. (Use http://localhost:3000 in Chrome/Edge for hardware acceleration).'
+        : 'WebCodecs hardware encoding is not supported in this browser. Running in MediaRecorder compatibility mode.';
+
+      return {
+        hasWebCodecs: false,
+        hasVideoEncoder,
+        hasAudioEncoder,
+        hasOffscreenCanvas,
+        hasMediaRecorder: true,
+        engine: 'mediarecorder',
+        supportedVideoCodec: 'h264',
+        supportedAudioCodec: 'aac',
+        audioCodecMime: 'mp4a.40.2',
+        recorderMimeType: recorderMimeType || 'video/webm',
+        warningMessage,
+      };
+    }
+
     return {
       hasWebCodecs: false,
       hasVideoEncoder,
       hasAudioEncoder,
       hasOffscreenCanvas,
+      hasMediaRecorder: false,
+      engine: 'none',
       errorMessage:
-        'WebCodecs (VideoEncoder / AudioEncoder) is not supported in this browser. Please use Google Chrome, Microsoft Edge, or a modern Chromium-based browser for in-browser video rendering.',
+        'In-browser video rendering is not supported in this browser. Please use Google Chrome, Microsoft Edge, or a modern browser.',
     };
   }
 
@@ -99,9 +151,12 @@ export async function checkBrowserWebCodecsSupport(): Promise<CodecSupportResult
     hasVideoEncoder,
     hasAudioEncoder,
     hasOffscreenCanvas,
+    hasMediaRecorder,
+    engine: 'webcodecs',
     supportedVideoCodec: supportedVideoCodec || 'avc1.42001f',
     supportedAudioCodec: supportedAudioCodec || 'aac',
     audioCodecMime: audioCodecMime || 'mp4a.40.2',
+    recorderMimeType,
   };
 }
 

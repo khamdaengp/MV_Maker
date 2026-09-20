@@ -127,6 +127,14 @@ export const RenderStep: React.FC = () => {
         </div>
       )}
 
+      {/* Codec Mode Notification Banner */}
+      {codecSupport?.warningMessage && (
+        <div className="p-3.5 rounded-2xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 text-amber-800 dark:text-amber-300 text-xs flex items-center space-x-2.5">
+          <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0" />
+          <span>{codecSupport.warningMessage}</span>
+        </div>
+      )}
+
       {/* Codec Specs Card */}
       <div className="p-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="flex items-center space-x-4">
@@ -140,7 +148,7 @@ export const RenderStep: React.FC = () => {
           <div>
             <span className="text-slate-400">Video Codec: </span>
             <strong className="text-slate-800 dark:text-slate-200">
-              H.264 (AVC) @ {output.videoBitrateMbps} Mbps
+              {codecSupport?.engine === 'mediarecorder' ? 'WebM / MP4' : 'H.264 (AVC)'} @ {output.videoBitrateMbps} Mbps
             </strong>
           </div>
           <div className="h-4 w-px bg-slate-200 dark:bg-slate-800 hidden sm:block" />
@@ -153,9 +161,17 @@ export const RenderStep: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center space-x-1.5 text-brand-600 dark:text-brand-400 font-semibold text-[11px]">
+        <div className={`flex items-center space-x-1.5 font-semibold text-[11px] ${
+          codecSupport?.engine === 'mediarecorder'
+            ? 'text-amber-600 dark:text-amber-400'
+            : 'text-brand-600 dark:text-brand-400'
+        }`}>
           <Sparkles className="w-3.5 h-3.5" />
-          <span>Offline Frame-Exact WebCodecs</span>
+          <span>
+            {codecSupport?.engine === 'mediarecorder'
+              ? 'MediaRecorder Compatibility'
+              : 'Hardware WebCodecs'}
+          </span>
         </div>
       </div>
 
